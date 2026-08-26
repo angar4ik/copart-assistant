@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Copart Max Bid",
+  "version": "2.0",
+  "description": "Shows a suggested max bid on Copart lot pages, read live from your local pricing server.",
+  "host_permissions": [
+    "http://localhost:8000/*",
+    "http://127.0.0.1:8000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.copart.com/lot/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
