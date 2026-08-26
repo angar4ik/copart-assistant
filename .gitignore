@@ -17,3 +17,4 @@ copart_listings*.json
 copart_listings*.csv
 history.csv
 auto_dev_cache.json
+live_bids.json

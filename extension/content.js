@@ -134,6 +134,9 @@
 
     const warns = [];
     if (over) warns.push('<div class="cmb-warn">&#9888; Current bid is above your max</div>');
+    if (window.innerWidth < 1025) {
+      warns.push('<div class="cmb-warn-amber">&#9888; Window too narrow &mdash; resize to &ge;1025px to track live bid</div>');
+    }
     if (d.price_source && d.price_source !== "auto.dev") {
       warns.push('<div class="cmb-warn-amber">&#9888; No Auto.dev price &mdash; using Copart estimate</div>');
     } else if (d.market_mileage_adjusted === false) {
@@ -157,6 +160,65 @@
     mountPanel(lot, '<div class="cmb-msg">' + msg + "</div>");
   }
 
+  // ---- live bid collection ----
+  function scrapePage() {
+    // Copart bug: the bid/lot details are hidden when viewport is under 1025px.
+    const tooNarrow = window.innerWidth < 1025;
+    const text = (tooNarrow || !document.body) ? "" : document.body.innerText;
+    let bid = null;
+    const bi = text.indexOf("Current bid");
+    if (bi >= 0) {
+      const m = text.slice(bi, bi + 200).match(/\$([\d,]+)/);
+      if (m) bid = parseInt(m[1].replace(/,/g, ""), 10);
+    }
+    const cd = (text.match(/(\d+D\s*\d+H\s*\d+min)/i) || [])[1] || null;
+    const st = (text.match(/(On approval|Minimum Bid|Pure sale|Sold|Not on sale|On minimum bid)/i) || [])[1] || null;
+    let odo = null;
+    const om = text.match(/Odometer:\s*([\d,]+)\s*mi/i);
+    if (om) odo = parseInt(om[1].replace(/,/g, ""), 10);
+    return { current_bid: bid, countdown: cd, sale_status: st, odometer: odo, too_narrow: tooNarrow };
+  }
+
+  function buildRecord(lot, d, scrape) {
+    const rec = { lot_number: lot };
+    if (d) {
+      rec.title = d.title || null;
+      rec.year = d.year != null ? d.year : null;
+      rec.make = d.make || null;
+      rec.model = d.model || null;
+      rec.condition_code = d.condition_code || null;
+      rec.title_group = d.title_group || null;
+      rec.yard = d.yard || null;
+      rec.market_price = d.market_price != null ? Number(d.market_price) : null;
+      rec.max_bid = d.max_bid != null ? Number(d.max_bid) : null;
+      rec.odometer = (d.odometer != null && Number(d.odometer) > 0) ? Number(d.odometer) : (scrape.odometer || null);
+    } else {
+      rec.title = (document.title || "").split("|")[0].trim() || null;
+      rec.odometer = scrape.odometer || null;
+    }
+    rec.current_bid = scrape.current_bid;
+    rec.countdown = scrape.countdown;
+    rec.sale_status = scrape.sale_status;
+    rec.client_time = new Date().toISOString();
+    return rec;
+  }
+
+  let lastSentKey = null;
+
+  function collectAndSend(lot, d) {
+    try {
+      const scrape = scrapePage();
+      if (scrape.too_narrow) return; // Copart hides bid below 1025px width
+      const rec = buildRecord(lot, d, scrape);
+      const key = lot + "|" + rec.current_bid + "|" + rec.sale_status;
+      if (key === lastSentKey) return;
+      lastSentKey = key;
+      chrome.runtime.sendMessage({ type: "postBid", data: rec }, function () {
+        if (chrome.runtime.lastError) { /* server may be off; ignore */ }
+      });
+    } catch (e) { /* ignore */ }
+  }
+
   async function render(lot, force) {
     const my = ++renderSeq;
     injectStyles();
@@ -165,8 +227,13 @@
       const p = await loadPricing(force);
       if (my !== renderSeq) return; // stale render, ignore
       const d = p.map[lot];
-      if (d) showRow(lot, d, p.asof);
-      else showMsg(lot, "No pricing data for this lot.");
+      if (d) {
+        showRow(lot, d, p.asof);
+        collectAndSend(lot, d);
+      } else {
+        showMsg(lot, "No pricing data for this lot.");
+        collectAndSend(lot, null);
+      }
     } catch (e) {
       if (my !== renderSeq) return;
       showMsg(lot, "Pricing server not running.<br>Start it from the menu (run pricing server), then click &#8635;.");
@@ -190,4 +257,25 @@
   // Copart is an SPA — watch for URL changes (no full reload between lots).
   setInterval(tick, 1000);
   tick();
+
+  // Sense bid changes in near-real-time: watch the DOM and re-collect immediately
+  // when the bid (or sale status) changes. collectAndSend() dedupes by value.
+  let bidDebounce = null;
+  const bidObserver = new MutationObserver(function () {
+    if (bidDebounce) return;
+    bidDebounce = setTimeout(function () {
+      bidDebounce = null;
+      const lot = getLotNumber();
+      if (!lot) return;
+      collectAndSend(lot, PRICING ? PRICING.map[lot] : null);
+    }, 300);
+  });
+  bidObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+
+  // Safety net in case a change slips past the observer.
+  setInterval(function () {
+    const lot = getLotNumber();
+    if (!lot) return;
+    collectAndSend(lot, PRICING ? PRICING.map[lot] : null);
+  }, 60000);
 })();

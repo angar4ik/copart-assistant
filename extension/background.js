@@ -8,9 +8,33 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
     fetchPricing()
       .then(function (resp) { sendResponse(resp); })
       .catch(function (e) { sendResponse({ ok: false, error: String(e && e.message || e) }); });
-    return true; // keep the message channel open for the async response
+    return true;
+  }
+  if (msg && msg.type === "postBid") {
+    postBid(msg.data)
+      .then(function (resp) { sendResponse(resp); })
+      .catch(function (e) { sendResponse({ ok: false, error: String(e && e.message || e) }); });
+    return true;
   }
 });
+
+async function postBid(data) {
+  let lastErr = null;
+  for (const base of SERVERS) {
+    try {
+      const res = await fetch(base + "/api/bid", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return { ok: true };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("server unreachable");
+}
 
 async function fetchPricing() {
   let lastErr = null;
