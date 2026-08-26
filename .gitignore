@@ -1,9 +1,6 @@
 # Secrets — never commit
 .env
 
-# Chrome login session (contains Copart cookies) — never commit
-profile/
-
 # Python
 __pycache__/
 *.pyc
@@ -12,9 +9,7 @@ __pycache__/
 *.log
 logs/
 
-# Generated data (recreated by the scripts)
-copart_listings*.json
-copart_listings*.csv
-history.csv
-auto_dev_cache.json
-live_bids.json
+# SQLite database (source of truth)
+copart.db
+copart.db-wal
+copart.db-shm

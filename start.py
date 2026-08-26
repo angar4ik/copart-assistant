@@ -1,22 +1,29 @@
 """
-Copart Tool — interactive startup menu (colored, in-place refresh).
+Copart Tool — startup menu (colored, in-place refresh).
 
-Shows project stats and lets you run each step:
-  [1] Scrape Copart          -> copart_scrape.py
-  [2] Grab pricing           -> pricing.py
-  [3] Scrape + pricing       -> both
-  [4] Run pricing server     -> server.py in a separate window
-  [5] Exit
+New workflow: you browse Copart yourself and the Chrome extension sends each
+lot to the local server, which prices it on demand. This menu just runs the
+server and offers a couple of maintenance helpers.
+
+  [1] Run pricing server      -> server.py in a separate window
+  [2] Re-price all lots       -> pricing.py (refresh all DB pricing)
+  [3] Clear Auto.dev cache    -> pricing.py --clear-cache
+  [4] Exit
 """
-import json, os, sys, subprocess, time, datetime, urllib.request
+import os
+import sys
+import subprocess
+import time
+import urllib.request
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import config
+import db
 
 OUT = os.path.dirname(os.path.abspath(__file__))
 PORT = 8000
 log = config.get_logger("menu", "menu.log")
 
-# ---- ANSI colors ----
+
 def enable_vt():
     """Turn on Windows virtual-terminal processing so ANSI colors render in cmd."""
     if os.name == "nt":
@@ -45,29 +52,11 @@ class C:
 
 
 def clear():
-    """Clear the console so the menu redraws in place (no duplicate copies)."""
     os.system("cls" if os.name == "nt" else "clear")
 
 
-# ---- file paths ----
-SCRAPE_JSON = os.path.join(OUT, "copart_listings.json")
-PRICED_JSON = os.path.join(OUT, "copart_listings_priced.json")
-CACHE_JSON = os.path.join(OUT, "auto_dev_cache.json")
-
-
-def mtime(path):
-    try:
-        return datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M:%S")
-    except OSError:
-        return "-"
-
-
-def load_json(path):
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+def row(label, value, vcolor=C.BOLD):
+    return "   %-13s  %s%s%s" % (C.GRAY + label + C.RST, vcolor, value, C.RST)
 
 
 def server_running():
@@ -78,23 +67,8 @@ def server_running():
         return False
 
 
-def row(label, value, vcolor=C.BOLD):
-    return "   %-13s  %s%s%s" % (C.GRAY + label + C.RST, vcolor, value, C.RST)
-
-
 def stats():
-    s = load_json(SCRAPE_JSON)
-    p = load_json(PRICED_JSON)
-    c = load_json(CACHE_JSON)
-
-    n_scraped = len(s) if isinstance(s, list) else 0
-    n_priced = len(p) if isinstance(p, list) else 0
-    n_maxbid = sum(1 for r in p if r.get("max_bid")) if isinstance(p, list) else 0
-    n_cache = len(c) if isinstance(c, dict) else 0
-
-    scrape_snap = "-"
-    if isinstance(s, list) and s and s[0].get("snapshot_date"):
-        scrape_snap = s[0]["snapshot_date"]
+    d = db.stats()
 
     if server_running():
         srv = C.GREEN + C.BOLD + "RUNNING   http://localhost:%d" % PORT + C.RST
@@ -107,34 +81,33 @@ def stats():
         bar,
         head,
         bar,
-        row("Last scrape", scrape_snap + "  " + C.DIM + "(" + mtime(SCRAPE_JSON) + ")" + C.RST),
-        row("Last pricing", mtime(PRICED_JSON)),
-        row("Lots scraped", str(n_scraped), C.BOLD),
-        row("Lots priced", "%d  (%d have max bid)" % (n_priced, n_maxbid), C.GREEN),
-        row("API cache", "%d entries" % n_cache, C.BOLD),
+        row("Last lot", d["last_scrape"] or "-"),
+        row("Last pricing", d["last_pricing"] or "-"),
+        row("Lots tracked", str(d["lots"]), C.BOLD),
+        row("Lots priced", "%d  (%d have max bid)" % (d["priced_lots"], d["max_bid_lots"]), C.GREEN),
+        row("Snapshots", "%d (history)" % d["snapshots"], C.DIM),
+        row("API cache", "%d entries" % d["cache"], C.BOLD),
         row("Server", srv, ""),
         bar,
     ])
 
 
 def menu():
-    running = server_running()
     opt = C.YELLOW + C.BOLD
     items = [
-        (opt + "[1]" + C.RST, "Scrape Copart"),
-        (opt + "[2]" + C.RST, "Grab pricing (Auto.dev)"),
-        (opt + "[3]" + C.RST, "Scrape + pricing (both)"),
-        (opt + "[4]" + C.RST, "Run pricing server" + C.DIM + "   (new window)" + C.RST),
-        (C.DIM + "[5]" + C.RST, C.DIM + "Exit" + C.RST),
+        (opt + "[1]" + C.RST, "Run pricing server" + C.DIM + "   (new window)" + C.RST),
+        (opt + "[2]" + C.RST, "Re-price all lots" + C.DIM + "   (Auto.dev)" + C.RST),
+        (opt + "[3]" + C.RST, "Clear Auto.dev cache"),
+        (C.DIM + "[4]" + C.RST, C.DIM + "Exit" + C.RST),
     ]
     return "\n".join("    %s  %s" % (k, v) for k, v in items)
 
 
-def run_script(script):
+def run_script(script, *args):
     path = os.path.join(OUT, script)
-    log.info("running: %s", script)
+    log.info("running: %s %s", script, " ".join(args))
     print("\n" + C.CYAN + ">>> Running: %s" % script + C.RST + "\n")
-    subprocess.run([sys.executable, path])
+    subprocess.run([sys.executable, path] + list(args))
     log.info("finished: %s", script)
     print("\n" + C.CYAN + ">>> Done: %s" % script + C.RST)
 
@@ -168,28 +141,25 @@ def pause():
 
 def main():
     enable_vt()
+    db.init_db()
     while True:
         clear()
         print(stats())
         print()
         print(menu())
         print()
-        choice = input("   Choose [1-5]: ").strip()
+        choice = input("   Choose [1-4]: ").strip()
         log.info("menu choice: %s", choice)
 
         if choice == "1":
-            run_script("copart_scrape.py")
-            pause()
+            run_server()
         elif choice == "2":
             run_script("pricing.py")
             pause()
         elif choice == "3":
-            run_script("copart_scrape.py")
-            run_script("pricing.py")
+            run_script("pricing.py", "--clear-cache")
             pause()
-        elif choice == "4":
-            run_server()
-        elif choice in ("5", "q", "quit", "exit"):
+        elif choice in ("4", "q", "quit", "exit"):
             log.info("exit")
             clear()
             print(C.CYAN + C.BOLD + "Bye." + C.RST)

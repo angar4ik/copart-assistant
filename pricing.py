@@ -1,5 +1,5 @@
 """
-Enrich copart_listings.json with real market prices from Auto.dev and compute max bid.
+Auto.dev market pricing for a single lot (called on demand by the server).
 
 market_price = median retail listing price for the vehicle's year/make/model
                (Florida listings first, nationwide fallback if < 3 results).
@@ -7,17 +7,25 @@ market_price = median retail listing price for the vehicle's year/make/model
                when at least 3 comparable-mileage listings exist.
 max_bid      = market_price * condition multiplier (non-runner discount)
 
-Usage:  python3 pricing.py
+Usage (optional CLI):
+  python3 pricing.py                # re-price every lot in the DB
+  python3 pricing.py refresh        # clear the Auto.dev cache, then re-price
+  python3 pricing.py --clear-cache  # clear the cache only
 """
-import json, os, sys, csv, time, statistics, urllib.request, urllib.parse, datetime
+import sys
+import json
+import re
+import time
+import statistics
+import urllib.request
+import urllib.parse
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import config
+import db
 
-OUT = os.path.dirname(os.path.abspath(__file__))
-KEY = config.require("AUTO_DEV_API_KEY")
 log = config.get_logger("pricing", "pricing.log")
 
-# ---- condition multipliers (same as scraper) ----
+# ---- condition multipliers ----
 CONDITION_MULTIPLIERS = {
     "CERT-D": 0.45,   # Run & Drive      -> drivable, mechanical issue present
     "CERT-E": 0.35,   # Enhanced         -> inspected, mechanical issue present
@@ -27,9 +35,7 @@ CONDITION_MULTIPLIERS = {
 DEFAULT_MULT = 0.20
 
 # ---- mileage matching (Auto.dev market price) ----
-# Prefer listings whose odometer is within +/- this fraction of the lot's miles.
 MILES_TOLERANCE = 0.30
-# If fewer than this many mileage-matched listings, fall back to all listings.
 MIN_MATCHES = 3
 
 # ---- Copart -> Auto.dev name mapping ----
@@ -56,39 +62,79 @@ MODEL_MAP = {
     "NX 200T": "NX 200t",
 }
 
+# Makes we can recognize in a Copart title (uppercase), longest first.
+MAKES = sorted(set(list(MAKE_MAP.keys()) + [
+    "MERCEDES-BENZ", "LAND ROVER", "ASTON MARTIN", "ALFA ROMEO", "ROLLS-ROYCE",
+    "ACURA", "CHRYSLER", "INFINITI", "MITSUBISHI", "VOLVO", "PORSCHE", "TESLA",
+    "FIAT", "MINI", "SCION", "PONTIAC", "SATURN", "SUZUKI", "ISUZU", "MERCURY",
+    "OLDSMOBILE", "PLYMOUTH", "HUMMER", "SAAB", "SMART", "GENESIS", "MASERATI",
+    "BENTLEY", "FERRARI", "LAMBORGHINI",
+]), key=len, reverse=True)
+
+
 def norm_make(m):
     return MAKE_MAP.get((m or "").upper(), (m or "").title())
+
 
 def norm_model(m):
     return MODEL_MAP.get((m or "").upper(), (m or "").title())
 
-CACHE_FILE = os.path.join(OUT, "auto_dev_cache.json")
+
+def _candidate_models(raw_model):
+    """Try progressively shorter model strings so a trim suffix (e.g. 'ELANTRA SEL')
+    still falls back to the base model ('Elantra'). Each is mapped via norm_model."""
+    words = (raw_model or "").split()
+    out = []
+    seen = set()
+    for i in range(len(words), 0, -1):
+        m = norm_model(" ".join(words[:i]))
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def parse_title(title):
+    """Return (year, make, model) from a Copart title like '2020 HYUNDAI ELANTRA SEL'.
+    make/model are Copart-style uppercase; norm_make/norm_model map them to Auto.dev."""
+    title = (title or "").strip()
+    m = re.search(r"\b(19|20)\d{2}\b", title)
+    year = int(m.group(0)) if m else None
+    rest = title.upper()
+    if m:
+        rest = (title[:m.start()] + " " + title[m.end():]).upper()
+    rest = re.sub(r"\s+", " ", rest).strip()
+    make = None
+    for mk in MAKES:
+        if rest == mk or rest.startswith(mk + " "):
+            make = mk
+            break
+    model = rest[len(make) + 1:].strip() if make else rest
+    return year, make, model
+
+
+def map_condition(text):
+    """Map a Copart condition label (from the lot page) to a CERT code."""
+    t = (text or "").upper()
+    if "RUN" in t and "DRIVE" in t:
+        return "CERT-D"
+    if "ENHANCED" in t:
+        return "CERT-E"
+    if "ENGINE START" in t or "START PROGRAM" in t or "STARTS" in t:
+        return "CERT-S"
+    return ""
+
+
+KEY = config.require("AUTO_DEV_API_KEY")
+
+# in-run mirror of the DB cache (avoids re-reading SQLite per lot)
 _cache = {}
 STATS = {"fresh": 0, "reused": 0}
+
 
 def _key(make, model, year):
     return "%s||%s||%s" % (make, model, year)
 
-def load_cache():
-    global _cache
-    _cache = {}
-    try:
-        with open(CACHE_FILE, encoding="utf-8") as f:
-            raw = json.load(f)
-        # v2 cache format: {key: {"scope": str, "listings": [{price, miles}, ...]}}
-        # Old-format entries ({"median": ...}) are ignored and re-queried.
-        for k, v in raw.items():
-            if isinstance(v, dict) and isinstance(v.get("listings"), list):
-                _cache[k] = v
-    except Exception:
-        _cache = {}
-
-def save_cache():
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_cache, f)
-    except Exception as e:
-        log.warning("cache save failed: %s", e)
 
 def auto_dev_query(make, model, year, state):
     params = {"vehicle.make": make, "vehicle.model": model, "vehicle.year": str(year), "limit": 20}
@@ -124,12 +170,25 @@ def auto_dev_query(make, model, year, state):
                 return None
             time.sleep(1)
 
+
 def get_market(make, model, year, odo=None):
     k = _key(make, model, year)
-    if k in _cache and _cache[k] is not None:
-        entry = _cache[k]
+    entry = _cache.get(k)
+    hit = k in _cache and entry is not None
+    if not hit:
+        entry = db.cache_get(make, model, year)
+        if entry is not None:
+            _cache[k] = entry
+            hit = True
+
+    if hit:
         STATS["reused"] += 1
+        if entry and entry.get("listings"):
+            odo_s = ("%s mi" % format(int(odo), ",")) if odo else "—"
+            log.info("pricing cache hit: %s %s %s (%s, %s comps)",
+                     year, make, model, odo_s, len(entry["listings"]))
     else:
+        log.info("NEW pricing search: %s %s %s", year, make, model)
         entry = None
         for scope in ("FL", None):
             listings = auto_dev_query(make, model, year, scope)
@@ -140,6 +199,8 @@ def get_market(make, model, year, odo=None):
                 break
             if entry is None or (listings and len(listings) > len(entry["listings"])):
                 entry = {"scope": scope or "US", "listings": listings}
+        if entry is not None:
+            db.cache_put(make, model, year, entry["scope"], entry["listings"])
         _cache[k] = entry
         STATS["fresh"] += 1
         time.sleep(0.15)
@@ -173,6 +234,7 @@ def get_market(make, model, year, odo=None):
         "mileage_adjusted": mileage_adjusted,
     }
 
+
 def first_positive(*vals):
     for v in vals:
         try:
@@ -183,96 +245,88 @@ def first_positive(*vals):
             return v
     return None
 
+
+def price_lot(lot):
+    """Compute pricing fields for one lot dict. Returns a pricing row (or None)."""
+    lot_number = lot.get("lot_number")
+    if not lot_number:
+        return None
+
+    mk = norm_make(lot.get("make"))
+    raw_model = lot.get("model") or ""
+    yr = lot.get("year")
+    try:
+        yr = int(yr)
+    except (TypeError, ValueError):
+        yr = None
+
+    odo = lot.get("odometer")
+    try:
+        odo = float(odo) if odo is not None else None
+    except (TypeError, ValueError):
+        odo = None
+
+    res = None
+    if yr and mk:
+        for cm in _candidate_models(raw_model):
+            res = get_market(mk, cm, yr, odo)
+            if res and res.get("median"):
+                break
+
+    code = (lot.get("condition_code") or "").strip().upper()
+    mult = CONDITION_MULTIPLIERS.get(code, DEFAULT_MULT)
+
+    pr = {
+        "lot_number": lot_number,
+        "condition_code": code,
+        "condition_discount_pct": round((1 - mult) * 100),
+    }
+    if res and res.get("median"):
+        pr["price_source"] = "auto.dev"
+        pr["market_price"] = res["median"]
+        pr["market_avg"] = res["mean"]
+        pr["market_n_listings"] = res["n"]
+        pr["market_scope"] = res["scope"]
+        pr["market_min"] = res["min"]
+        pr["market_max"] = res["max"]
+        pr["market_miles_matched"] = res.get("miles_matched")
+        pr["market_mileage_adjusted"] = 1 if res.get("mileage_adjusted") else 0
+    else:
+        fb = first_positive(lot.get("acv"), lot.get("est_retail_value"), lot.get("buy_now_price"))
+        pr["price_source"] = "copart_fallback"
+        pr["market_price"] = fb
+        pr["market_avg"] = fb
+        pr["market_n_listings"] = (res or {}).get("n", 0)
+        pr["market_scope"] = (res or {}).get("scope", "")
+        pr["market_min"] = (res or {}).get("min")
+        pr["market_max"] = (res or {}).get("max")
+        pr["market_miles_matched"] = None
+        pr["market_mileage_adjusted"] = None
+
+    pr["max_bid"] = round(pr["market_price"] * mult) if pr["market_price"] else None
+    return pr
+
+
 def main():
-    log.info("pricing started")
-    load_cache()
+    db.init_db()
+    if "--clear-cache" in sys.argv[1:]:
+        db.cache_clear()
+        log.info("Auto.dev cache cleared")
+        print("Auto.dev cache cleared.")
+        return
     if "refresh" in sys.argv[1:]:
-        _cache.clear()
+        db.cache_clear()
         log.info("cache cleared (refresh flag)")
-    rows = json.load(open(os.path.join(OUT, "copart_listings.json"), encoding="utf-8"))
-    log.info("enriching %s lots (cache has %s entries)", len(rows), len(_cache))
 
-    n_autodev = n_fallback = 0
-    for i, r in enumerate(rows):
-        mk = norm_make(r.get("make"))
-        md = norm_model(r.get("model"))
-        yr = r.get("year")
-        try:
-            yr = int(yr)
-        except (TypeError, ValueError):
-            yr = None
+    rows = db.all_lots()
+    log.info("re-pricing %s lots", len(rows))
+    run_id = db.now()
+    pricings = [p for p in (price_lot(r) for r in rows) if p]
+    db.save_pricings(pricings, run_id)
+    priced = [p for p in pricings if p.get("max_bid")]
+    log.info("saved %s pricings (%s with max bid)", len(pricings), len(priced))
+    print("Re-priced %s lots (%s with max bid)." % (len(pricings), len(priced)))
 
-        odo = r.get("odometer")
-        try:
-            odo = float(odo) if odo is not None else None
-        except (TypeError, ValueError):
-            odo = None
-
-        res = get_market(mk, md, yr, odo) if yr else None
-        if res and res.get("median"):
-            r["market_price"] = res["median"]
-            r["market_avg"] = res["mean"]
-            r["market_n_listings"] = res["n"]
-            r["market_scope"] = res["scope"]
-            r["market_min"] = res["min"]
-            r["market_max"] = res["max"]
-            r["market_miles_matched"] = res.get("miles_matched")
-            r["market_mileage_adjusted"] = res.get("mileage_adjusted")
-            r["price_source"] = "auto.dev"
-            n_autodev += 1
-        else:
-            # fallback to Copart's own ACV / est retail / buy-now
-            fb = first_positive(r.get("acv"), r.get("est_retail_value"), r.get("buy_now_price"))
-            r["market_price"] = fb
-            r["market_avg"] = fb
-            r["market_n_listings"] = (res or {}).get("n", 0)
-            r["market_scope"] = (res or {}).get("scope", "")
-            r["market_min"] = (res or {}).get("min")
-            r["market_max"] = (res or {}).get("max")
-            r["market_miles_matched"] = None
-            r["market_mileage_adjusted"] = None
-            r["price_source"] = "copart_fallback"
-            n_fallback += 1
-
-        # max bid = market_price * condition multiplier
-        code = (r.get("condition_code") or "").strip().upper()
-        mult = CONDITION_MULTIPLIERS.get(code, DEFAULT_MULT)
-        mp = r.get("market_price")
-        r["condition_discount_pct"] = round((1 - mult) * 100)
-        r["max_bid"] = round(mp * mult) if mp else None
-
-        if (i + 1) % 5 == 0:
-            log.info("progress %d/%d", i + 1, len(rows))
-
-    log.info("auto.dev priced: %s | copart fallback: %s", n_autodev, n_fallback)
-
-    # order columns
-    order = list(rows[0].keys())
-    # write json
-    with open(os.path.join(OUT, "copart_listings_priced.json"), "w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=1, default=str)
-    # write csv
-    with open(os.path.join(OUT, "copart_listings_priced.csv"), "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=order)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-    log.info("saved copart_listings_priced.csv / .json")
-    save_cache()
-    log.info("api calls this run: %s fresh | %s reused from cache", STATS["fresh"], STATS["reused"])
-
-    # summary
-    priced = [r for r in rows if r.get("max_bid")]
-    if priced:
-        import collections
-        log.info("max_bid median: $%s | range $%s - $%s",
-                 round(statistics.median(r["max_bid"] for r in priced)),
-                 min(r["max_bid"] for r in priced), max(r["max_bid"] for r in priced))
-        log.info("price_source: %s", collections.Counter(r["price_source"] for r in rows))
-        log.info("market scope: %s", collections.Counter((r.get("market_scope") or "-") for r in rows))
-        log.info("mileage-adjusted lots: %d of %d",
-                 sum(1 for r in rows if r.get("market_mileage_adjusted")), len(rows))
-    log.info("pricing finished")
 
 if __name__ == "__main__":
     main()

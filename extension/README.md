@@ -1,21 +1,28 @@
 # Copart Max Bid — Chrome extension (server-backed)
 
 Shows a **suggested max bid** on every Copart lot page, bottom-right corner.
-Reads pricing **live from your local server** — no re-packing needed when data changes.
+When a lot page opens, it scrapes the vehicle details and POSTs them to your
+local server, which stores + prices the car and returns the data to display.
+
+Market pricing only — no bid/live-auction tracking.
 
 ## How it works
 
 ```
-copart.com lot page ──content.js──► background.js ──fetch──► http://localhost:8000/copart_listings_priced.json
+copart.com lot page ──content.js──► background.js ──POST /api/lot──► http://localhost:8000
+                                      (service worker)                    │
+                                                                          ▼
+                                                              server upserts + prices
+                                                                          │
+                            panel renders the returned record ◄───────────┘
 ```
 
-The fetch happens in a **background service worker** (extension context), not the page,
-so it isn't blocked by the browser's cross-origin / mixed-content rules.
+The fetch happens in a **background service worker** (extension context), not the
+page, so it isn't blocked by the browser's cross-origin / mixed-content rules.
 
 ## Prerequisites
 
-1. Start the pricing server: menu `[4] Run pricing server`, or `python3 server.py`.
-   It serves `copart_listings_priced.json` at `http://localhost:8000`.
+1. Start the pricing server: `python3 server.py` (or `python3 start.py` → `[1]`).
 
 ## Install (one time)
 
@@ -26,26 +33,22 @@ so it isn't blocked by the browser's cross-origin / mixed-content rules.
    `C:\Users\4anga\Downloads\pi-windows-x64\copart\extension`
 5. Open a Copart lot page → panel appears bottom-right.
 
-## Update pricing
-
-```
-python3 start.py     # menu: scrape + pricing
-```
-
-Then reload the lot page (or click the ↻ refresh button in the panel).
-No need to reload the extension.
-
 ## Panel
 
 - Vehicle title + lot number
-- Condition, market value (median FL retail), discount %
+- Condition, odometer, market value (median FL retail), discount %
 - **Suggested max bid** (big green number)
-- Buy-It-Now / current bid (if present)
-- ⚠ warning if the current bid exceeds your max
+- Buy-It-Now (if present)
+- ⚠ warnings for missing/mileage-adjusted pricing
 - ↻ refresh button, × hide button
 
 ## Files
 
 - `manifest.json` — MV3 manifest (host permissions for localhost:8000 + background worker)
-- `content.js` — reads lot # from URL, renders the panel, asks background for data
-- `background.js` — service worker that fetches the JSON from the local server
+- `content.js` — scrapes title / odometer / condition / yard / vin / specs, renders the panel
+- `background.js` — service worker that POSTs the lot to the local server
+
+## Notes
+
+- The extension extracts details from page text; if Copart changes its layout,
+  update the selectors in `content.js`.

@@ -1,63 +1,45 @@
 # Copart Assistant
 
-A toolkit for finding, pricing, and tracking **Copart** auction vehicles — focused on
-**Florida (Ocala + Orlando North + Orlando South), Clean Title, Mechanical-damage**
-vehicles — plus a Chrome extension that shows a live **max-bid** suggestion and records
-bid activity as auctions progress.
+A small local tool that shows a **suggested max bid** on Copart lot pages and
+builds a searchable history of every vehicle you look at — with **no automated
+scraping**. You browse Copart normally; a Chrome extension sends each lot to a
+local server, which stores it in SQLite and prices it on demand via Auto.dev.
 
 ---
 
-## What it does
+## How it works
 
-| Step | Tool | Output |
-|---|---|---|
-| 1. Scrape Copart | `copart_scrape.py` | `copart_listings.json` / `.csv`, appends `history.csv` |
-| 2. Price from market | `pricing.py` | `copart_listings_priced.json` / `.csv` |
-| 3. Serve data locally | `server.py` | `http://localhost:8000` |
-| 4. Browse + track bids | Chrome extension (`extension/`) | panel on lot pages, records to `live_bids.json` |
+```
+you browse Copart ──► lot page opens ──► extension scrapes the page
+                                              │  POST /api/lot
+                                              ▼
+                              local server (server.py)
+                              ├─ upsert lot + snapshot (SQLite)
+                              ├─ if not priced yet: query Auto.dev (cached)
+                              └─ return the full record
+                                              │
+                                              ▼
+                              extension shows the max-bid panel
+```
 
-Everything is driven by an interactive menu (`start.py` / `start.bat`).
+For each lot the server keeps:
+
+- **identity** (`lots`) — year / make / model / title, first & last seen
+- **history** (`snapshots`) — odometer, condition, yard per visit
+- **valuation** (`pricings`) — market price, max bid, mileage flags per pricing run
+- **Auto.dev comps** (`market_cache`) — cached per make/model/year
+
+Everything lives in one SQLite file, `copart.db`.
 
 ---
 
 ## Quick start
 
-```bash
-python3 start.py        # or double-click start.bat
-```
-
-Menu:
-
-```
-  [1] Scrape Copart
-  [2] Grab pricing (Auto.dev)
-  [3] Scrape + pricing (both)
-  [4] Run pricing server   (http://localhost:8000)
-  [5] Exit
-```
-
-Recommended first run:
-
-1. `[1]` Scrape Copart (headless Chrome, no window)
-2. `[2]` Grab pricing (Auto.dev market values)
-3. `[4]` Run pricing server (for the Chrome extension)
-
----
-
-## Configuration (`.env`)
-
-Copy `.env.example` to `.env` and fill in your values. `.env` is gitignored.
-
-```bash
-COPART_EMAIL=you@example.com
-COPART_PASSWORD=your-password
-AUTO_DEV_API_KEY=sk_...          # free key at https://www.auto.dev
-HEADLESS=true                    # true = no Chrome window; false = visible browser
-```
-
-- `COPART_EMAIL` / `COPART_PASSWORD` — your Copart member sign-in.
-- `AUTO_DEV_API_KEY` — Auto.dev API key (free tier: 1,000 calls/month).
-- `HEADLESS` — run the scraper's browser in windowless mode (`true` by default).
+1. Start the server: `python3 start.py` → `[1] Run pricing server`
+   (or directly `python3 server.py`).
+2. Load the extension (see below).
+3. Browse Copart and open any lot page — the panel appears bottom-right, and the
+   server prices the car automatically on first sight.
 
 ---
 
@@ -74,7 +56,7 @@ market_price = median retail listing price for the vehicle's year/make/model
 max_bid = market_price × condition multiplier
 ```
 
-Condition multipliers (in `copart_scrape.py` and `pricing.py`):
+Condition multipliers (`pricing.py`):
 
 | Copart condition | Meaning | Multiplier |
 |---|---|---|
@@ -83,19 +65,32 @@ Condition multipliers (in `copart_scrape.py` and `pricing.py`):
 | `CERT-S` | Engine Start (does not drive) | 0.25 |
 | *(unknown)* | assume non-runner | 0.20 |
 
-Tunables in `pricing.py`:
+Tunables in `pricing.py`: `MILES_TOLERANCE = 0.30`, `MIN_MATCHES = 3`,
+`CONDITION_MULTIPLIERS`.
 
-- `MILES_TOLERANCE = 0.30` — odometer match window (±30%).
-- `MIN_MATCHES = 3` — min comparable-mileage listings before using them.
-- `CONDITION_MULTIPLIERS` — the discount per condition tier.
-
-The Auto.dev results are cached in `auto_dev_cache.json` (keyed by `make|model|year`)
-so re-runs only query the API for new models.
+The condition code is mapped from the lot page's label ("Run & Drive" →
+`CERT-D`, "Enhanced Vehicles" → `CERT-E`, "Engine Start" → `CERT-S`), and
+year/make/model are parsed from the lot title. Pricing is computed **once per
+car** and stored; re-visits reuse the stored valuation.
 
 ```bash
-python3 pricing.py          # reuse cache, only price new lots
-python3 pricing.py refresh  # force re-fetch everything
+python3 pricing.py                # re-price every lot in the DB
+python3 pricing.py refresh        # clear the Auto.dev cache, then re-price
+python3 pricing.py --clear-cache  # clear the cache only
 ```
+
+---
+
+## Configuration (`.env`)
+
+Copy `.env.example` to `.env` and fill in your values. `.env` is gitignored.
+
+```bash
+AUTO_DEV_API_KEY=sk_...          # free key at https://www.auto.dev
+```
+
+`COPART_EMAIL` / `COPART_PASSWORD` / `HEADLESS` are **no longer needed** — there
+is no automated login or scraping anymore.
 
 ---
 
@@ -106,67 +101,37 @@ Loads on `https://www.copart.com/lot/*` and shows a panel (bottom-right) with:
 - Vehicle title + lot number
 - Condition, odometer, market value, discount %
 - **Suggested max bid** (big green number)
-- Buy-It-Now / current bid
+- Buy-It-Now (if present)
 - Warnings:
-  - ⚠ current bid already above your max
   - ⚠ no Auto.dev price (using Copart estimate)
   - ⚠ high mileage — no comparable comps
-  - ⚠ window too narrow (see note below)
+  - ⚠ no odometer data — price not mileage-adjusted
 
 ### Install (one time)
 
 1. Chrome → `chrome://extensions`
 2. Enable **Developer mode**
 3. **Load unpacked** → select the `extension/` folder
-4. Start the pricing server (menu `[4]`) and open a lot page
+4. Start the pricing server and open a lot page
 
 ### Update after code changes
 
 Click the ↻ reload icon on the extension in `chrome://extensions`, then reload the lot page.
 
-> **Copart bug:** the current bid is not rendered when the viewport is narrower than
-> **1025 px**. Keep the Chrome window ≥1025 px wide so the panel can read the live bid.
-
 ---
 
-## Live bid collection
+## Database
 
-While a lot page is open, the extension scrapes and POSTs the following to the server,
-which appends each record to `live_bids.json`:
+All data lives in a single SQLite file, `copart.db` (gitignored).
 
-```json
-{
-  "lot_number": "65845396",
-  "title": "2020 HYUNDAI ELANTRA SEL",
-  "year": 2020, "make": "HYUNDAI", "model": "ELANTRA",
-  "odometer": 178561,
-  "current_bid": 375,
-  "countdown": "0D 1H 45min",
-  "sale_status": "On approval",
-  "max_bid": 4424, "market_price": 12640,
-  "condition_code": "CERT-E", "yard": "FL - ORLANDO NORTH",
-  "client_time": "...", "server_time": "..."
-}
-```
-
-- Sent immediately when the page loads, and re-sent **the moment the bid or sale
-  status changes** (via a `MutationObserver`, ~300 ms debounce).
-- Deduped by `bid + sale_status` — countdown ticking alone does not spam records.
-- A 60 s safety-net poll catches anything the observer misses.
-
----
-
-## Data files
-
-| File | Purpose |
+| Table | Purpose |
 |---|---|
-| `copart_listings.json` / `.csv` | Raw scrape output (current filtered lots) |
-| `copart_listings_priced.json` / `.csv` | Final output with `market_price`, `max_bid`, mileage flags |
-| `history.csv` | Append-only snapshot history (one dated row-set per scrape) |
-| `auto_dev_cache.json` | Auto.dev API cache |
-| `live_bids.json` | Collected live bid records from the extension |
+| `lots` | One row per vehicle (stable identity + attributes) |
+| `snapshots` | One row per lot per visit — builds history over time |
+| `pricings` | One row per lot per pricing run — `market_price`, `max_bid`, mileage flags |
+| `market_cache` | Auto.dev API cache (comps per make/model/year) |
 
-All of the above are gitignored (generated data).
+Query it directly with `sqlite3 copart.db` or any SQLite GUI.
 
 ---
 
@@ -174,7 +139,6 @@ All of the above are gitignored (generated data).
 
 Every script writes timestamped logs to `logs/` (rotating, 2 MB × 3 backups):
 
-- `logs/scrape.log`
 - `logs/pricing.log`
 - `logs/menu.log`
 - `logs/server.log`
@@ -185,19 +149,19 @@ Every script writes timestamped logs to `logs/` (rotating, 2 MB × 3 backups):
 
 ```
 copart/
-├── start.py / start.bat      # interactive menu
-├── copart_scrape.py          # Copart scraper (headless browser + search API)
-├── pricing.py                # Auto.dev pricing + mileage matching + cache
-├── server.py                 # local HTTP server (static + POST /api/bid)
+├── start.py / start.bat      # menu (run server, re-price, clear cache)
+├── server.py                 # local HTTP server (POST /api/lot)
+├── pricing.py                # Auto.dev pricing + title parsing + cache
+├── db.py                     # SQLite schema + all read/write helpers
 ├── config.py                 # .env loader + logger helper
+├── copart.db                 # SQLite database (source of truth, gitignored)
 ├── .env / .env.example       # secrets (gitignored) / template
 ├── extension/
 │   ├── manifest.json         # MV3 manifest
-│   ├── content.js            # panel, scraping, MutationObserver
-│   ├── background.js         # fetch pricing + POST bids (extension context)
+│   ├── content.js            # scrapes lot page, renders panel
+│   ├── background.js         # POSTs to the local server (extension context)
 │   └── README.md
-├── logs/                     # rotating logs
-└── (generated data files)
+└── logs/                     # rotating logs
 ```
 
 ---
@@ -205,14 +169,17 @@ copart/
 ## Requirements
 
 - Python 3 (use `python3`)
-- Real Google Chrome (for the scraper's stealth browser)
-- A Copart account (free/Guest tier works, but full VINs are masked)
 - A free Auto.dev API key
+- Chrome (for the extension)
 
 ## Notes & caveats
 
-- Copart only exposes **current/upcoming** lots via search; sold lots are not
-  retroactively queryable. `history.csv` + `live_bids.json` build that history over time.
-- Guest-tier Copart accounts mask the last 6 VIN digits.
-- The mileage-matched median can still overvalue very high-mileage lots when fewer
-  than 3 comparable listings exist — the plugin flags these with an amber warning.
+- Pricing is computed once per car on first sight; it is **not** re-fetched on
+  every visit (Auto.dev data is cached per make/model/year). Use
+  `pricing.py refresh` to force a full re-price.
+- The extension extracts lot details from the page text (title, odometer,
+  condition, yard). If Copart changes its page layout, those fields may
+  need selector updates in `extension/content.js`.
+- The mileage-matched median can still overvalue very high-mileage lots when
+  fewer than 3 comparable listings exist — the panel flags these with an amber
+  warning.
