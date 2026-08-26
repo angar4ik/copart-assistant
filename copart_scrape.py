@@ -24,6 +24,8 @@ OUT = os.path.dirname(os.path.abspath(__file__))
 PROFILE = os.path.join(OUT, "profile")
 EMAIL = config.require("COPART_EMAIL")
 PASS = config.require("COPART_PASSWORD")
+HEADLESS = config.get_bool("HEADLESS", True)
+log = config.get_logger("scrape", "scrape.log")
 
 # --- Your filter: FL, Ocala + Orlando North + Orlando South, Mechanical damage, Clean Title ---
 FILTER = {
@@ -124,7 +126,9 @@ async def ensure_login(browser, tab):
     url = await js(tab, "document.location.href")
     body = await js(tab, "document.body.innerText.slice(0,2000)")
     if "dashboard" in url and "Sign in" not in (body or ""):
+        log.info("already logged in")
         return True
+    log.info("logging in to Copart...")
     await tab.get("https://www.copart.com/login")
     await tab.wait(6)
     await js(tab, "(function(){var b=document.getElementById('onetrust-accept-btn-handler');if(b)b.click();return 1;})()")
@@ -209,7 +213,8 @@ FIELDS = ["lot_number","year","make","model","trim","title","body_style","color"
           "value_anchor","market_value","condition_discount_pct","max_bid"]
 
 async def main():
-    kwargs = {"headless": False, "sandbox": False, "user_data_dir": PROFILE}
+    log.info("starting scrape (headless=%s)", HEADLESS)
+    kwargs = {"headless": HEADLESS, "sandbox": False, "user_data_dir": PROFILE}
     if CHROME_PATH:
         kwargs["browser_executable_path"] = CHROME_PATH
     browser = await uc.start(**kwargs)
@@ -233,7 +238,7 @@ async def main():
     rows = [clean_lot(c) for c in all_lots]
     for r in rows:
         r.update(price_lot(r))
-    print("[i] total lots:", total, "| fetched:", len(rows))
+    log.info("total lots: %s | fetched: %s", total, len(rows))
 
     snap = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for r in rows:
@@ -259,27 +264,28 @@ async def main():
         for r in rows:
             w.writerow(r)
 
-    print("[i] saved:", csv_path)
-    print("[i] saved:", json_path)
-    print("[i] history:", hist_path)
+    log.info("saved CSV: %s", csv_path)
+    log.info("saved JSON: %s", json_path)
+    log.info("appended history: %s", hist_path)
 
     # ---- summary ----
     priced = [r for r in rows if r["max_bid"] is not None]
-    print("\n[summary] max_bid computed for", len(priced), "of", len(rows), "lots")
     from collections import Counter
-    print("[summary] anchor used:", Counter(r["value_anchor"] for r in priced))
-    print("[summary] by condition:", Counter((r["condition_code"] or "UNKNOWN").strip() for r in rows))
-    print("[summary] by yard:", Counter(r["yard"] for r in rows))
+    log.info("max_bid computed for %s of %s lots", len(priced), len(rows))
+    log.info("anchor used: %s", Counter(r["value_anchor"] for r in priced))
+    log.info("by condition: %s", Counter((r["condition_code"] or "UNKNOWN").strip() for r in rows))
+    log.info("by yard: %s", Counter(r["yard"] for r in rows))
     if priced:
         import statistics
         bids = [r["max_bid"] for r in priced]
-        print("[summary] max_bid range: $%s - $%s, median $%s" % (min(bids), max(bids), round(statistics.median(bids))))
+        log.info("max_bid range: $%s - $%s | median $%s", min(bids), max(bids), round(statistics.median(bids)))
 
     browser.stop()
     # Let the event loop drain Chrome's subprocess pipes before shutdown.
     # Otherwise Windows' ProactorEventLoop prints harmless "Exception ignored
     # while calling deallocator ... I/O operation on closed pipe" noise at exit.
     await asyncio.sleep(1.5)
+    log.info("scrape finished")
 
 if __name__ == "__main__":
     asyncio.run(main())

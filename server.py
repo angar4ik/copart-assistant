@@ -6,9 +6,11 @@ Run:  python3 server.py            (default http://localhost:8000)
 """
 import http.server, socketserver, os, sys
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+import config
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
 DIR = os.path.dirname(os.path.abspath(__file__))
+log = config.get_logger("server", "server.log")
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -30,7 +32,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("[server] " + fmt % args + "\n")
+        log.info(fmt % args)
 
 
 class Server(socketserver.ThreadingTCPServer):
@@ -40,10 +42,13 @@ class Server(socketserver.ThreadingTCPServer):
 
 if __name__ == "__main__":
     with Server(("", PORT), Handler) as httpd:
+        log.info("pricing server running on http://localhost:%d", PORT)
+        log.info("serving folder: %s", DIR)
         print("Pricing server running:  http://localhost:%d" % PORT)
         print("Serving folder: %s" % DIR)
         print("Press Ctrl+C to stop.\n")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
+            log.info("server stopped")
             print("\nServer stopped.")

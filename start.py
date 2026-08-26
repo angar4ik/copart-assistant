@@ -10,9 +10,11 @@ Shows project stats and lets you run each step:
 """
 import json, os, sys, subprocess, time, datetime, urllib.request
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+import config
 
 OUT = os.path.dirname(os.path.abspath(__file__))
 PORT = 8000
+log = config.get_logger("menu", "menu.log")
 
 # ---- ANSI colors ----
 def enable_vt():
@@ -130,8 +132,10 @@ def menu():
 
 def run_script(script):
     path = os.path.join(OUT, script)
+    log.info("running: %s", script)
     print("\n" + C.CYAN + ">>> Running: %s" % script + C.RST + "\n")
     subprocess.run([sys.executable, path])
+    log.info("finished: %s", script)
     print("\n" + C.CYAN + ">>> Done: %s" % script + C.RST)
 
 
@@ -140,6 +144,7 @@ def run_server():
         print("\n" + C.GREEN + "Server is already running at http://localhost:%d" % PORT + C.RST)
         time.sleep(0.8)
         return
+    log.info("starting pricing server (new window)")
     path = os.path.join(OUT, "server.py")
     print("\n" + C.CYAN + "Starting pricing server in a new window (close that window to stop it)..." + C.RST)
     kwargs = {}
@@ -170,6 +175,7 @@ def main():
         print(menu())
         print()
         choice = input("   Choose [1-5]: ").strip()
+        log.info("menu choice: %s", choice)
 
         if choice == "1":
             run_script("copart_scrape.py")
@@ -184,6 +190,7 @@ def main():
         elif choice == "4":
             run_server()
         elif choice in ("5", "q", "quit", "exit"):
+            log.info("exit")
             clear()
             print(C.CYAN + C.BOLD + "Bye." + C.RST)
             break

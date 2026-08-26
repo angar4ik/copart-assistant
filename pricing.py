@@ -13,6 +13,7 @@ import config
 
 OUT = os.path.dirname(os.path.abspath(__file__))
 KEY = config.require("AUTO_DEV_API_KEY")
+log = config.get_logger("pricing", "pricing.log")
 
 # ---- condition multipliers (same as scraper) ----
 CONDITION_MULTIPLIERS = {
@@ -73,7 +74,7 @@ def save_cache():
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(_cache, f)
     except Exception as e:
-        print("  [warn] cache save failed:", e)
+        log.warning("cache save failed: %s", e)
 
 def auto_dev_query(make, model, year, state):
     params = {"vehicle.make": make, "vehicle.model": model, "vehicle.year": str(year), "limit": 20}
@@ -91,7 +92,7 @@ def auto_dev_query(make, model, year, state):
             return prices
         except Exception as e:
             if attempt == 2:
-                print("  [warn] auto.dev error %s %s %s: %s" % (make, model, year, str(e)[:80]))
+                log.warning("auto.dev error %s %s %s: %s", make, model, year, str(e)[:80])
                 return None
             time.sleep(1)
 
@@ -140,12 +141,13 @@ def first_positive(*vals):
     return None
 
 def main():
+    log.info("pricing started")
     load_cache()
     if "refresh" in sys.argv[1:]:
         _cache.clear()
-        print("[i] cache cleared (refresh flag)")
+        log.info("cache cleared (refresh flag)")
     rows = json.load(open(os.path.join(OUT, "copart_listings.json"), encoding="utf-8"))
-    print("[i] enriching", len(rows), "lots (cache has %d entries)" % len(_cache))
+    log.info("enriching %s lots (cache has %s entries)", len(rows), len(_cache))
 
     n_autodev = n_fallback = 0
     for i, r in enumerate(rows):
@@ -187,9 +189,9 @@ def main():
         r["max_bid"] = round(mp * mult) if mp else None
 
         if (i + 1) % 5 == 0:
-            print("  ...%d/%d" % (i + 1, len(rows)), flush=True)
+            log.info("progress %d/%d", i + 1, len(rows))
 
-    print("[i] auto.dev priced:", n_autodev, "| copart fallback:", n_fallback)
+    log.info("auto.dev priced: %s | copart fallback: %s", n_autodev, n_fallback)
 
     # order columns
     order = list(rows[0].keys())
@@ -202,19 +204,20 @@ def main():
         w.writeheader()
         for r in rows:
             w.writerow(r)
-    print("[i] saved copart_listings_priced.csv / .json")
+    log.info("saved copart_listings_priced.csv / .json")
     save_cache()
-    print("[i] api calls this run: %d fresh | %d reused from cache" % (STATS["fresh"], STATS["reused"]))
+    log.info("api calls this run: %s fresh | %s reused from cache", STATS["fresh"], STATS["reused"])
 
     # summary
     priced = [r for r in rows if r.get("max_bid")]
     if priced:
         import collections
-        print("[summary] max_bid median: $%s | range $%s - $%s" % (
-            round(statistics.median(r["max_bid"] for r in priced)),
-            min(r["max_bid"] for r in priced), max(r["max_bid"] for r in priced)))
-        print("[summary] price_source:", collections.Counter(r["price_source"] for r in rows))
-        print("[summary] market scope:", collections.Counter((r.get("market_scope") or "-") for r in rows))
+        log.info("max_bid median: $%s | range $%s - $%s",
+                 round(statistics.median(r["max_bid"] for r in priced)),
+                 min(r["max_bid"] for r in priced), max(r["max_bid"] for r in priced))
+        log.info("price_source: %s", collections.Counter(r["price_source"] for r in rows))
+        log.info("market scope: %s", collections.Counter((r.get("market_scope") or "-") for r in rows))
+    log.info("pricing finished")
 
 if __name__ == "__main__":
     main()
