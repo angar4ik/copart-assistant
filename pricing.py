@@ -2,7 +2,9 @@
 Enrich copart_listings.json with real market prices from Auto.dev and compute max bid.
 
 market_price = median retail listing price for the vehicle's year/make/model
-               (Florida listings first, nationwide fallback if < 3 results)
+               (Florida listings first, nationwide fallback if < 3 results).
+               Listings are mileage-matched to the lot's odometer (+/- 30%)
+               when at least 3 comparable-mileage listings exist.
 max_bid      = market_price * condition multiplier (non-runner discount)
 
 Usage:  python3 pricing.py
@@ -23,6 +25,12 @@ CONDITION_MULTIPLIERS = {
     "":       0.20,   # unknown          -> assume non-runner
 }
 DEFAULT_MULT = 0.20
+
+# ---- mileage matching (Auto.dev market price) ----
+# Prefer listings whose odometer is within +/- this fraction of the lot's miles.
+MILES_TOLERANCE = 0.30
+# If fewer than this many mileage-matched listings, fall back to all listings.
+MIN_MATCHES = 3
 
 # ---- Copart -> Auto.dev name mapping ----
 MAKE_MAP = {
@@ -63,9 +71,15 @@ def _key(make, model, year):
 
 def load_cache():
     global _cache
+    _cache = {}
     try:
         with open(CACHE_FILE, encoding="utf-8") as f:
-            _cache = json.load(f)
+            raw = json.load(f)
+        # v2 cache format: {key: {"scope": str, "listings": [{price, miles}, ...]}}
+        # Old-format entries ({"median": ...}) are ignored and re-queried.
+        for k, v in raw.items():
+            if isinstance(v, dict) and isinstance(v.get("listings"), list):
+                _cache[k] = v
     except Exception:
         _cache = {}
 
@@ -87,48 +101,77 @@ def auto_dev_query(make, model, year, state):
             with urllib.request.urlopen(req, timeout=12) as r:
                 d = json.load(r)
             listings = d.get("data") or []
-            prices = [float(x["retailListing"]["price"]) for x in listings
-                      if x.get("retailListing") and x["retailListing"].get("price")]
-            return prices
+            out = []
+            for x in listings:
+                rl = x.get("retailListing") or {}
+                p = rl.get("price")
+                if p is None:
+                    continue
+                try:
+                    p = float(p)
+                except (TypeError, ValueError):
+                    continue
+                miles = rl.get("miles")
+                try:
+                    miles = float(miles) if miles is not None else None
+                except (TypeError, ValueError):
+                    miles = None
+                out.append({"price": p, "miles": miles})
+            return out
         except Exception as e:
             if attempt == 2:
                 log.warning("auto.dev error %s %s %s: %s", make, model, year, str(e)[:80])
                 return None
             time.sleep(1)
 
-def get_market(make, model, year):
+def get_market(make, model, year, odo=None):
     k = _key(make, model, year)
-    if k in _cache:
+    if k in _cache and _cache[k] is not None:
+        entry = _cache[k]
         STATS["reused"] += 1
-        return _cache[k]
-    result = None
-    for scope in ("FL", None):
-        prices = auto_dev_query(make, model, year, scope)
-        if prices is None:
-            continue
-        if len(prices) >= 3:
-            result = {
-                "median": round(statistics.median(prices)),
-                "mean": round(statistics.mean(prices)),
-                "n": len(prices),
-                "scope": scope or "US",
-                "min": round(min(prices)), "max": round(max(prices)),
-            }
-            break
-        # remember partial result
-        if result is None or (prices and len(prices) > result.get("n", 0)):
-            result = {
-                "median": round(statistics.median(prices)) if prices else None,
-                "mean": round(statistics.mean(prices)) if prices else None,
-                "n": len(prices),
-                "scope": scope or "US",
-                "min": round(min(prices)) if prices else None,
-                "max": round(max(prices)) if prices else None,
-            }
-    _cache[k] = result
-    STATS["fresh"] += 1
-    time.sleep(0.15)
-    return result
+    else:
+        entry = None
+        for scope in ("FL", None):
+            listings = auto_dev_query(make, model, year, scope)
+            if listings is None:
+                continue
+            if len(listings) >= 3:
+                entry = {"scope": scope or "US", "listings": listings}
+                break
+            if entry is None or (listings and len(listings) > len(entry["listings"])):
+                entry = {"scope": scope or "US", "listings": listings}
+        _cache[k] = entry
+        STATS["fresh"] += 1
+        time.sleep(0.15)
+
+    if not entry or not entry.get("listings"):
+        return None
+
+    listings = entry["listings"]
+    n_matched = None
+    mileage_adjusted = None
+    if odo and odo > 0:
+        lo = odo * (1 - MILES_TOLERANCE)
+        hi = odo * (1 + MILES_TOLERANCE)
+        matched = [l for l in listings if l.get("miles") is not None and lo <= l["miles"] <= hi]
+        n_matched = len(matched)
+        mileage_adjusted = n_matched >= MIN_MATCHES
+        if mileage_adjusted:
+            listings = matched
+
+    prices = [l["price"] for l in listings if l.get("price") is not None]
+    if not prices:
+        return None
+    return {
+        "median": round(statistics.median(prices)),
+        "mean": round(statistics.mean(prices)),
+        "n": len(prices),
+        "scope": entry["scope"],
+        "min": round(min(prices)),
+        "max": round(max(prices)),
+        "miles_matched": n_matched,
+        "mileage_adjusted": mileage_adjusted,
+    }
 
 def first_positive(*vals):
     for v in vals:
@@ -159,7 +202,13 @@ def main():
         except (TypeError, ValueError):
             yr = None
 
-        res = get_market(mk, md, yr) if yr else None
+        odo = r.get("odometer")
+        try:
+            odo = float(odo) if odo is not None else None
+        except (TypeError, ValueError):
+            odo = None
+
+        res = get_market(mk, md, yr, odo) if yr else None
         if res and res.get("median"):
             r["market_price"] = res["median"]
             r["market_avg"] = res["mean"]
@@ -167,6 +216,8 @@ def main():
             r["market_scope"] = res["scope"]
             r["market_min"] = res["min"]
             r["market_max"] = res["max"]
+            r["market_miles_matched"] = res.get("miles_matched")
+            r["market_mileage_adjusted"] = res.get("mileage_adjusted")
             r["price_source"] = "auto.dev"
             n_autodev += 1
         else:
@@ -178,6 +229,8 @@ def main():
             r["market_scope"] = (res or {}).get("scope", "")
             r["market_min"] = (res or {}).get("min")
             r["market_max"] = (res or {}).get("max")
+            r["market_miles_matched"] = None
+            r["market_mileage_adjusted"] = None
             r["price_source"] = "copart_fallback"
             n_fallback += 1
 
@@ -217,6 +270,8 @@ def main():
                  min(r["max_bid"] for r in priced), max(r["max_bid"] for r in priced))
         log.info("price_source: %s", collections.Counter(r["price_source"] for r in rows))
         log.info("market scope: %s", collections.Counter((r.get("market_scope") or "-") for r in rows))
+        log.info("mileage-adjusted lots: %d of %d",
+                 sum(1 for r in rows if r.get("market_mileage_adjusted")), len(rows))
     log.info("pricing finished")
 
 if __name__ == "__main__":

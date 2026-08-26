@@ -82,6 +82,8 @@
       "#" + PANEL_ID + " .cmb-max-label{text-align:center;color:#64748b;font-size:11px;margin-bottom:6px;}" +
       "#" + PANEL_ID + " .cmb-warn{background:#7f1d1d;color:#fecaca;border:1px solid #dc2626;" +
       "border-radius:8px;padding:6px 8px;margin-top:8px;font-size:12px;}" +
+      "#" + PANEL_ID + " .cmb-warn-amber{background:#78350f;color:#fde68a;border:1px solid #d97706;" +
+      "border-radius:8px;padding:6px 8px;margin-top:8px;font-size:12px;}" +
       "#" + PANEL_ID + " .cmb-foot{color:#475569;font-size:10px;margin-top:10px;text-align:center;}" +
       "#" + PANEL_ID + " .cmb-msg{color:#94a3b8;text-align:center;padding:16px;}";
     const s = document.createElement("style");
@@ -114,8 +116,12 @@
   function showRow(lot, d, asof) {
     const over = d.current_bid != null && d.max_bid != null && Number(d.current_bid) > Number(d.max_bid);
     const cond = COND_LABEL[(d.condition_code || "").trim().toUpperCase()] || COND_LABEL[""];
+    const odo = d.odometer != null && Number(d.odometer) > 0
+      ? Math.round(Number(d.odometer)).toLocaleString("en-US") + " mi"
+      : "—";
     const rows = [
       ["Condition", cond],
+      ["Odometer", odo],
       ["Market value", fmt(d.market_price) + (d.market_scope ? " (" + d.market_scope + ")" : "")],
       ["Discount", d.condition_discount_pct != null ? d.condition_discount_pct + "%" : "—"],
     ];
@@ -126,7 +132,16 @@
       return '<div class="cmb-row"><span class="cmb-k">' + r[0] + '</span><span class="cmb-v">' + r[1] + "</span></div>";
     }).join("");
 
-    const warnHtml = over ? '<div class="cmb-warn">&#9888; Current bid is above your max</div>' : "";
+    const warns = [];
+    if (over) warns.push('<div class="cmb-warn">&#9888; Current bid is above your max</div>');
+    if (d.price_source && d.price_source !== "auto.dev") {
+      warns.push('<div class="cmb-warn-amber">&#9888; No Auto.dev price &mdash; using Copart estimate</div>');
+    } else if (d.market_mileage_adjusted === false) {
+      warns.push('<div class="cmb-warn-amber">&#9888; High mileage &mdash; no comparable comps, price may be off</div>');
+    } else if (d.market_mileage_adjusted == null) {
+      warns.push('<div class="cmb-warn-amber">&#9888; No odometer data &mdash; price not mileage-adjusted</div>');
+    }
+    const warnHtml = warns.join("");
     const src = (d.price_source || "") + (asof ? " &middot; " + asof : "");
 
     mountPanel(lot,
