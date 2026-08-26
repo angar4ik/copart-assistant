@@ -1,11 +1,11 @@
 """
-Copart Tool — interactive startup menu.
+Copart Tool — interactive startup menu (colored, in-place refresh).
 
 Shows project stats and lets you run each step:
   [1] Scrape Copart          -> copart_scrape.py
   [2] Grab pricing           -> pricing.py
   [3] Scrape + pricing       -> both
-  [4] Run pricing server     -> server.py (http://localhost:8000)
+  [4] Run pricing server     -> server.py in a separate window
   [5] Exit
 """
 import json, os, sys, subprocess, time, datetime, urllib.request
@@ -13,6 +13,39 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 OUT = os.path.dirname(os.path.abspath(__file__))
 PORT = 8000
+
+# ---- ANSI colors ----
+def enable_vt():
+    """Turn on Windows virtual-terminal processing so ANSI colors render in cmd."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            m = ctypes.c_uint32()
+            k.GetConsoleMode(h, ctypes.byref(m))
+            k.SetConsoleMode(h, m.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        except Exception:
+            pass
+
+
+class C:
+    RST = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    GRAY = "\033[90m"
+
+
+def clear():
+    """Clear the console so the menu redraws in place (no duplicate copies)."""
+    os.system("cls" if os.name == "nt" else "clear")
+
 
 # ---- file paths ----
 SCRAPE_JSON = os.path.join(OUT, "copart_listings.json")
@@ -43,6 +76,10 @@ def server_running():
         return False
 
 
+def row(label, value, vcolor=C.BOLD):
+    return "   %-13s  %s%s%s" % (C.GRAY + label + C.RST, vcolor, value, C.RST)
+
+
 def stats():
     s = load_json(SCRAPE_JSON)
     p = load_json(PRICED_JSON)
@@ -57,72 +94,102 @@ def stats():
     if isinstance(s, list) and s and s[0].get("snapshot_date"):
         scrape_snap = s[0]["snapshot_date"]
 
-    lines = []
-    lines.append("=" * 52)
-    lines.append("  COPART TOOL")
-    lines.append("=" * 52)
-    lines.append("  Last scrape :  %s   (file %s)" % (scrape_snap, mtime(SCRAPE_JSON)))
-    lines.append("  Last pricing:  %s" % mtime(PRICED_JSON))
-    lines.append("  Lots scraped:  %d" % n_scraped)
-    lines.append("  Lots priced :  %d  (%d have a max bid)" % (n_priced, n_maxbid))
-    lines.append("  API cache   :  %d entries" % n_cache)
-    lines.append("  Server      :  %s" % ("RUNNING  http://localhost:%d" % PORT if server_running() else "stopped"))
-    lines.append("=" * 52)
-    return "\n".join(lines)
+    if server_running():
+        srv = C.GREEN + C.BOLD + "RUNNING   http://localhost:%d" % PORT + C.RST
+    else:
+        srv = C.RED + "stopped" + C.RST
+
+    bar = C.CYAN + C.BOLD + "=" * 50 + C.RST
+    head = C.CYAN + C.BOLD + "   COPART ASSISTANT" + C.RST
+    return "\n".join([
+        bar,
+        head,
+        bar,
+        row("Last scrape", scrape_snap + "  " + C.DIM + "(" + mtime(SCRAPE_JSON) + ")" + C.RST),
+        row("Last pricing", mtime(PRICED_JSON)),
+        row("Lots scraped", str(n_scraped), C.BOLD),
+        row("Lots priced", "%d  (%d have max bid)" % (n_priced, n_maxbid), C.GREEN),
+        row("API cache", "%d entries" % n_cache, C.BOLD),
+        row("Server", srv, ""),
+        bar,
+    ])
 
 
-def run_script(script, *args):
+def menu():
+    running = server_running()
+    opt = C.YELLOW + C.BOLD
+    items = [
+        (opt + "[1]" + C.RST, "Scrape Copart"),
+        (opt + "[2]" + C.RST, "Grab pricing (Auto.dev)"),
+        (opt + "[3]" + C.RST, "Scrape + pricing (both)"),
+        (opt + "[4]" + C.RST, "Run pricing server" + C.DIM + "   (new window)" + C.RST),
+        (C.DIM + "[5]" + C.RST, C.DIM + "Exit" + C.RST),
+    ]
+    return "\n".join("    %s  %s" % (k, v) for k, v in items)
+
+
+def run_script(script):
     path = os.path.join(OUT, script)
-    print("\n>>> Running: %s %s\n" % (script, " ".join(args)))
-    subprocess.run([sys.executable, path] + list(args))
-    print("\n>>> Done: %s\n" % script)
+    print("\n" + C.CYAN + ">>> Running: %s" % script + C.RST + "\n")
+    subprocess.run([sys.executable, path])
+    print("\n" + C.CYAN + ">>> Done: %s" % script + C.RST)
 
 
 def run_server():
     if server_running():
-        print("\nServer is already running at http://localhost:%d\n" % PORT)
+        print("\n" + C.GREEN + "Server is already running at http://localhost:%d" % PORT + C.RST)
+        time.sleep(0.8)
         return
     path = os.path.join(OUT, "server.py")
-    print("\nStarting pricing server in a new window (close that window to stop it)...\n")
+    print("\n" + C.CYAN + "Starting pricing server in a new window (close that window to stop it)..." + C.RST)
     kwargs = {}
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
     subprocess.Popen([sys.executable, path], **kwargs)
-    time.sleep(2)
+    time.sleep(1.5)
     if server_running():
-        print("Server is UP at http://localhost:%d\n" % PORT)
+        print(C.GREEN + "Server is UP at http://localhost:%d" % PORT + C.RST)
     else:
-        print("Server window opened — check it for errors.\n")
+        print(C.RED + "Server window opened — check it for errors." + C.RST)
+    time.sleep(0.8)
 
 
-MENU = """
-  [1] Scrape Copart
-  [2] Grab pricing (Auto.dev)
-  [3] Scrape + pricing (both)
-  [4] Run pricing server  (http://localhost:%d)
-  [5] Exit
-""" % PORT
+def pause():
+    try:
+        input("\n" + C.GRAY + "Press Enter to return to menu..." + C.RST)
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 
 def main():
+    enable_vt()
     while True:
-        print("\n" + stats())
-        print(MENU)
-        choice = input("Choose [1-5]: ").strip()
+        clear()
+        print(stats())
+        print()
+        print(menu())
+        print()
+        choice = input("   Choose [1-5]: ").strip()
+
         if choice == "1":
             run_script("copart_scrape.py")
+            pause()
         elif choice == "2":
             run_script("pricing.py")
+            pause()
         elif choice == "3":
             run_script("copart_scrape.py")
             run_script("pricing.py")
+            pause()
         elif choice == "4":
             run_server()
         elif choice in ("5", "q", "quit", "exit"):
-            print("\nBye.")
+            clear()
+            print(C.CYAN + C.BOLD + "Bye." + C.RST)
             break
         else:
-            print("\nInvalid choice.")
+            print("\n" + C.RED + "Invalid choice." + C.RST)
+            time.sleep(0.8)
 
 
 if __name__ == "__main__":

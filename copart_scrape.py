@@ -276,6 +276,10 @@ async def main():
         print("[summary] max_bid range: $%s - $%s, median $%s" % (min(bids), max(bids), round(statistics.median(bids))))
 
     browser.stop()
+    # Let the event loop drain Chrome's subprocess pipes before shutdown.
+    # Otherwise Windows' ProactorEventLoop prints harmless "Exception ignored
+    # while calling deallocator ... I/O operation on closed pipe" noise at exit.
+    await asyncio.sleep(1.5)
 
 if __name__ == "__main__":
     asyncio.run(main())
